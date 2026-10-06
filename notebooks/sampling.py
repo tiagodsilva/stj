@@ -322,7 +322,8 @@ def _(
         freqs = state.mean(axis=0)
         probs = get_item_marg(get_items(num_items))
 
-        return jnp.abs(freqs - probs).max()
+        diff = jnp.abs(freqs - probs)
+        return diff.max(), diff.mean()
 
     return eval_step, train_step
 
