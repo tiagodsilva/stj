@@ -323,7 +323,7 @@ def _(
 
 @app.cell
 def _():
-    num_items = 16
+    num_items = 32
     return (num_items,)
 
 
@@ -390,7 +390,7 @@ def _(PolicyMLP, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
 
         return eval_step(key, pol, bs, num_items)
 
-    train_mlp(num_items=num_items, steps=int(1e3))
+    train_mlp(num_items=num_items, steps=int(3e3))
     return
 
 
@@ -402,7 +402,7 @@ def _(Policy, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
         key = jax.random.key(seed)
         rngs = nnx.Rngs(key)
 
-        pol = Policy(num_items, dmid=16, rngs=rngs)
+        pol = Policy(num_items, dmid=16, n_inducing=4, rngs=rngs)
         opt = create_opt(pol, lr=1e-3)
 
         for _ in (pbar := tqdm.trange(steps)):
@@ -411,7 +411,7 @@ def _(Policy, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
 
         return eval_step(key, pol, bs, num_items)
 
-    train_transformer(num_items=num_items, steps=int(1e3))
+    train_transformer(num_items=num_items, steps=int(3e3))
     return
 
 

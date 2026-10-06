@@ -45,6 +45,7 @@ class Attention(nnx.Module):
         q = self.proj_q(q)
         k = self.proj_k(k)
         v = self.proj_v(v)
+
         y = (
             nnx.softmax((q @ k.T) / self.sqrt_d + attn_mask, axis=-1) @ v
         )  # (S, dim)
@@ -93,7 +94,7 @@ class LayerNorm(nnx.Module):
         self.axis = axis
         self.eps = eps
         self.gamma = nnx.Param(jnp.ones((d,)))
-        self.beta = nnx.Param(jnp.ones((d,)))
+        self.beta = nnx.Param(jnp.zeros((d,)))
 
     def __call__(self, x: jax.Array):
         var = jnp.var(x, keepdims=True, axis=self.axis)
@@ -162,10 +163,11 @@ class SetTransformerLayer(nnx.Module):
         mq = Attention._get_mask(x, mask)
         if self.n_inducing:
             mk = jnp.ones((self.n_inducing,), dtype=jnp.bool)
-            h = self.ln_in(x + self.mha(x, self.ips, mq, mk))
+            h = self.mha(x, self.ips, mq, mk)
         else:
             mk = mq
-            h = self.ln_in(x + self.mha(x, x, mq, mk))
+            h = self.mha(x, x, mq, mk)
+        h = self.ln_in(x + h)
         y = self.ln_out(h + self.ff(h))
         return y
 
