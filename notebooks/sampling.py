@@ -219,21 +219,27 @@ def _(EnvState, Policy, fapply, jax, jnp, nnx):
     return (fstep,)
 
 
-@app.cell(hide_code=True)
+@app.cell
 def _(EnvState, jax, jnp):
-    def get_items(num_items: int, r: float = 2, seed: int = 43):
+    # def get_items(num_items: int, r: float = 2, seed: int = 43):
+    #     key = jax.random.key(seed)
+
+    #     items = jnp.ones((num_items))
+    #     items = items.at[: num_items // 2].set(r)
+    #     items = items.at[num_items // 2 :].set(-r)
+
+    #     return jax.random.permutation(key, items)
+
+    def get_items(num_items: int, seed: int = 43):
         key = jax.random.key(seed)
-
-        items = jnp.ones((num_items))
-        items = items.at[: num_items // 2].set(r)
-        items = items.at[num_items // 2 :].set(-r)
-
-        return jax.random.permutation(key, items)
+        key, *_ = jax.random.split(key, 3)
+        log_u_template = jax.random.normal(key, (num_items,))
+        return log_u_template
 
     def logr(x: EnvState):
         # We use a deterministic policy
         items = get_items(x.num_items)
-        return jnp.sum(items * x.state, axis=1)
+        return jnp.einsum("bi,i->b", x.state, items)
 
     return get_items, logr
 
@@ -290,7 +296,7 @@ def _(
             )
             logrs = logr(x)
             loss = logrs + (blogits - flogits).sum(axis=0) - pol.logz
-            loss = jnp.mean(loss**2)
+            loss = jnp.var(loss)
             return loss, nk
 
         (loss, key), grads = nnx.value_and_grad(
@@ -316,14 +322,14 @@ def _(
         freqs = state.mean(axis=0)
         probs = get_item_marg(get_items(num_items))
 
-        return jnp.abs(freqs - probs).mean()
+        return jnp.abs(freqs - probs).max()
 
     return eval_step, train_step
 
 
 @app.cell
 def _():
-    num_items = 32
+    num_items = 64
     return (num_items,)
 
 
@@ -382,7 +388,7 @@ def _(PolicyMLP, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
         rngs = nnx.Rngs(key)
 
         pol = PolicyMLP(num_items, dmid=32, rngs=rngs)
-        opt = create_opt(pol)
+        opt = create_opt(pol, lr=1e-3)
 
         for _ in (pbar := tqdm.trange(steps)):
             loss, key = train_step(key, pol, opt, bs=bs, num_items=num_items)
@@ -390,7 +396,7 @@ def _(PolicyMLP, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
 
         return eval_step(key, pol, bs, num_items)
 
-    train_mlp(num_items=num_items, steps=int(3e3))
+    train_mlp(num_items=num_items, steps=int(1e3))
     return
 
 
@@ -402,7 +408,7 @@ def _(Policy, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
         key = jax.random.key(seed)
         rngs = nnx.Rngs(key)
 
-        pol = Policy(num_items, dmid=16, n_inducing=4, rngs=rngs)
+        pol = Policy(num_items, dmid=16, n_inducing=4, nlayers=1, rngs=rngs)
         opt = create_opt(pol, lr=1e-3)
 
         for _ in (pbar := tqdm.trange(steps)):
@@ -411,7 +417,7 @@ def _(Policy, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
 
         return eval_step(key, pol, bs, num_items)
 
-    train_transformer(num_items=num_items, steps=int(3e3))
+    train_transformer(num_items=num_items, steps=int(1e3))
     return
 
 
