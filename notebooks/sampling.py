@@ -17,8 +17,20 @@ def _():
     from functools import partial
 
     from stj.nets import SetTransformer, MLP
+    from stj.moe import MoELayer, GatedMoETopK
 
-    return MLP, SetTransformer, jax, jnp, nnx, optax, partial, struct, tqdm
+    return (
+        GatedMoETopK,
+        MLP,
+        SetTransformer,
+        jax,
+        jnp,
+        nnx,
+        optax,
+        partial,
+        struct,
+        tqdm,
+    )
 
 
 @app.cell
@@ -68,7 +80,7 @@ def _(jax, jnp, struct):
 
 
 @app.cell
-def _(EnvState, MLP, NIL, SetTransformer, jax, jnp, nnx):
+def _(EnvState, GatedMoETopK, MLP, NIL, SetTransformer, jax, jnp, nnx):
     class Policy(nnx.Module):
         def __init__(
             self,
@@ -126,7 +138,31 @@ def _(EnvState, MLP, NIL, SetTransformer, jax, jnp, nnx):
                 jnp.where(x.fmask == 1, l, -jnp.inf), axis=1
             )
 
-    return Policy, PolicyMLP
+    class PolicyMoE(nnx.Module):
+        def __init__(
+            self,
+            num_items: int,
+            dmid: int,
+            nlayers: int = 2,
+            num_experts: int = 8,
+            K: int = 2,
+            *,
+            rngs: nnx.Rngs,
+        ):
+            self.logz = nnx.Param(jnp.array(0.0))
+            self.model = GatedMoETopK(
+                num_items, dmid, num_experts=num_experts, K=K, rngs=rngs
+            )
+            self.linear = nnx.Linear(dmid, num_items + 1, rngs=rngs)
+
+        def __call__(self, x: EnvState):
+            y = jax.vmap(self.model, in_axes=(0,), out_axes=0)(x.state)
+            l = self.linear(nnx.leaky_relu(y))
+            return nnx.log_softmax(
+                jnp.where(x.fmask == 1, l, -jnp.inf), axis=1
+            )
+
+    return Policy, PolicyMLP, PolicyMoE
 
 
 @app.cell
@@ -383,12 +419,31 @@ def _(jax, jnp, partial):
 
 
 @app.cell
-def _(PolicyMLP, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
-    def train_mlp(num_items: int, steps: int, bs: int = 32, seed: int = 42):
+def _(
+    PolicyMLP,
+    PolicyMoE,
+    create_opt,
+    eval_step,
+    jax,
+    nnx,
+    num_items,
+    tqdm,
+    train_step,
+):
+    def train_mlp(
+        num_items: int,
+        steps: int,
+        bs: int = 32,
+        seed: int = 42,
+        moe: bool = False,
+    ):
         key = jax.random.key(seed)
         rngs = nnx.Rngs(key)
 
-        pol = PolicyMLP(num_items, dmid=32, rngs=rngs)
+        if not moe:
+            pol = PolicyMLP(num_items, dmid=32, rngs=rngs)
+        else:
+            pol = PolicyMoE(num_items, dmid=16, rngs=rngs)
         opt = create_opt(pol, lr=1e-3)
 
         for _ in (pbar := tqdm.trange(steps)):
@@ -397,7 +452,8 @@ def _(PolicyMLP, create_opt, eval_step, jax, nnx, num_items, tqdm, train_step):
 
         return eval_step(key, pol, bs, num_items)
 
-    train_mlp(num_items=num_items, steps=int(1e3))
+    print(train_mlp(num_items=num_items, steps=int(1e3), moe=False))
+    print(train_mlp(num_items=num_items, steps=int(1e3), moe=True))
     return
 
 
