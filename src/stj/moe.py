@@ -171,36 +171,33 @@ class GatedMoELayerNonRagged(GatedMoELayerRagged):
 
 
 if __name__ == "__main__":
-    # N = 32
-    # D = 512
-    # E = 8
-    # B = 64
-    seed = 42
-    N = 4
+    N = 32
     D = 512
-    E = 16
-    B = 512
-    K = 2
+    E = 8
+    B = 64
+    seed = 42
 
     key = jax.random.key(seed)
     rngs = nnx.Rngs(key)
 
-    #     x = jax.random.normal(key, shape=(N,))
-    #     exp = jnp.array(E // 2, dtype=jnp.int32)
-    #
-    #     moe = MoELayer(N, D, E, rngs=rngs)
-    #     print(moe(x, exp).shape)
-    #
-    #     # Check out vmapped operations
-    #     x = jnp.broadcast_to(jax.random.normal(key, shape=(1, N)), (B, N))
-    #     exp = jax.random.categorical(key, jnp.ones((E,)), shape=(B,))
-    #     print(jax.vmap(moe, in_axes=(0, 0), out_axes=0)(x, exp), exp)
-    #
+    x = jax.random.normal(key, shape=(N,))
+    exp = jnp.array(E // 2, dtype=jnp.int32)
+
+    moe = MoELayer(N, D, E, rngs=rngs)
+    print(moe(x, exp).shape)
+
+    # Check out vmapped operations
+    x = jnp.broadcast_to(jax.random.normal(key, shape=(1, N)), (B, N))
+    exp = jax.random.categorical(key, jnp.ones((E,)), shape=(B,))
+    print(jax.vmap(moe, in_axes=(0, 0), out_axes=0)(x, exp), exp)
+
     # Check out the Gated Layer
     x = jax.random.normal(key, (B, N))
     K = E // 2
-    #     moe_gated = GatedMoETopK(N, D, E, K, rngs=rngs)
-    #     print(moe_gated(x).shape)
+    moe_gated = GatedMoETopK(N, D, E, K, rngs=rngs)
+    print(moe_gated(x).shape)
+
+    # Ragged versions
     moe_gated_ragged = GatedMoELayerRagged(N, D, E, K, rngs=nnx.Rngs(seed))
     moe_gated_non_ragged = GatedMoELayerRagged(N, D, E, K, rngs=nnx.Rngs(seed))
 
