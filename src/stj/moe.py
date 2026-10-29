@@ -246,6 +246,20 @@ def count_params(model: nnx.Module) -> int:
     return sum(p.size for p in jax.tree.leaves(params))
 
 
+def count_flops(model: nnx.Module, x: jax.Array) -> int:
+    og_scan = jax.lax.scan
+    try:
+        jax.lax.scan = lambda f, init, xs=None, length=None, reverse=False: (
+            og_scan(
+                f, init, xs=xs, length=length, reverse=reverse, unroll=True
+            )
+        )
+        ca = jax.jit(model).lower(x).cost_analysis()
+        return ca["flops"]
+    finally:
+        jax.lax.scan = og_scan
+
+
 def build_models(din: int, dmid: int, seed: int):
     return [
         (
@@ -442,7 +456,7 @@ def benchmark_runtime(f: callable, xs: jax.Array, warmup: int = 8) -> float:
 
 def main():
     N = 32
-    D = 512
+    D = 128
     B = 64
     seed = 42
 
@@ -482,15 +496,16 @@ def main():
     repeat = 128
     xs = jax.random.normal(key, (repeat, B, N))
     print(
-        f"\n{'Model':<38} | {'Depth':>5} | {'E':>3} | {'Params':>10} | {'Runtime (32 calls, ms)':>22} | {'Per call (ms)':>13}"
+        f"\n{'Model':<38} | {'Depth':>5} | {'E':>3} | {'Params':>10} | {'Runtime (32 calls, ms)':>22} | {'Per call (ms)':>13} | {'Flops':>10}"
     )
-    print("-" * 105)
+    print("-" * 125)
     for name, depth, e_val, model in models:
         params = count_params(model)
+        flops = count_flops(model, xs[-1])
         total_ms = benchmark_runtime(jax.jit(model), xs)
         per_call_ms = total_ms / repeat
         print(
-            f"{name:<38} | {depth:>5} | {e_val:>3} | {params:>10,d} | {total_ms:>22.2f} | {per_call_ms:>13.3f}"
+            f"{name:<38} | {depth:>5} | {e_val:>3} | {params:>10,d} | {total_ms:>22.2f} | {per_call_ms:>13.3f}  | {flops:>10.2e}"
         )
 
 
