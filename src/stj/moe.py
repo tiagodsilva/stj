@@ -289,6 +289,90 @@ def build_models(din: int, dmid: int, seed: int):
             ),
         ),
         (
+            "RaggedMoE (E=16, K=1, L=4)",
+            4,
+            16,
+            GatedMoELayerRagged(
+                din,
+                dmid,
+                num_experts=16,
+                K=1,
+                nlayers=2,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "NonRaggedMoE (E=16, K=1, L=4)",
+            4,
+            16,
+            GatedMoELayerNonRagged(
+                din,
+                dmid,
+                num_experts=16,
+                K=1,
+                nlayers=2,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "RaggedMoE (E=16, K=1, L=3)",
+            3,
+            16,
+            GatedMoELayerRagged(
+                din,
+                dmid,
+                num_experts=16,
+                K=1,
+                nlayers=1,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "NonRaggedMoE (E=16, K=1, L=3)",
+            3,
+            16,
+            GatedMoELayerNonRagged(
+                din,
+                dmid,
+                num_experts=16,
+                K=1,
+                nlayers=1,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "RaggedMoE (E=8, K=1, L=3)",
+            3,
+            8,
+            GatedMoELayerRagged(
+                din,
+                dmid,
+                num_experts=8,
+                K=1,
+                nlayers=1,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "NonRaggedMoE (E=8, K=1, L=3)",
+            3,
+            8,
+            GatedMoELayerNonRagged(
+                din,
+                dmid,
+                num_experts=8,
+                K=1,
+                nlayers=1,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
             "LowRankMoE (E=8, K=1, r=32, L=4)",
             4,
             8,
@@ -351,9 +435,8 @@ def benchmark_runtime(f: callable, xs: jax.Array, warmup: int = 8) -> float:
     for _ in range(warmup):
         f(xs[-1]).block_until_ready()
     t = time.monotonic_ns()
-    for idx in range(xs.shape[0]):
-        y: jax.Array = f(xs[idx])
-        y.block_until_ready()
+    _, ys = jax.lax.scan(lambda y, x: (y, f(x)), init=xs, xs=xs)
+    ys.block_until_ready()
     return (time.monotonic_ns() - t) / 1e6
 
 
@@ -396,7 +479,7 @@ def main():
         bool(jnp.isclose(ragged(x), non_ragged(x), atol=1e-5).all()),
     )
 
-    repeat = 32
+    repeat = 128
     xs = jax.random.normal(key, (repeat, B, N))
     print(
         f"\n{'Model':<38} | {'Depth':>5} | {'E':>3} | {'Params':>10} | {'Runtime (32 calls, ms)':>22} | {'Per call (ms)':>13}"
@@ -407,7 +490,7 @@ def main():
         total_ms = benchmark_runtime(jax.jit(model), xs)
         per_call_ms = total_ms / repeat
         print(
-            f"{name:<38} | {str(depth):>5} | {str(e_val):>3} | {params:>10,d} | {total_ms:>22.2f} | {per_call_ms:>13.3f}"
+            f"{name:<38} | {depth:>5} | {e_val:>3} | {params:>10,d} | {total_ms:>22.2f} | {per_call_ms:>13.3f}"
         )
 
 
