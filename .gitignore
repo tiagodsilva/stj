@@ -10,3 +10,4 @@ __marimo__/
 
 # Virtual environments
 .venv
+gemini_tests

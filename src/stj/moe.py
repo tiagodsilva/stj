@@ -1,7 +1,6 @@
 import time
 
 import flax.nnx as nnx
-import flax.struct as struct
 import jax
 import jax.numpy as jnp
 
@@ -22,7 +21,6 @@ class MoELayer(nnx.Module):
 
         self.din = din
         self.dmid = dmid
-
         self.num_experts = num_experts
 
         def build_expert(rngs):
@@ -34,7 +32,6 @@ class MoELayer(nnx.Module):
             return build_expert(rngs=rngs)
 
         self.expert_graphdef, _ = nnx.split(build_expert(rngs=rngs))
-
         self.experts = create_layer(rngs)
 
     # This is applies to an unbatched state; vmapping is necessary
@@ -66,16 +63,21 @@ class GatedMoETopK(nnx.Module):
         )
 
         # Classifier for computing the logits
-        self.clf = nnx.Linear(self.dmid, self.num_experts, rngs=rngs)
+        self.clf = nnx.Linear(self.din, self.num_experts, rngs=rngs)
 
-    def __call__(self, x: jax.Array):
+    def _forward_single(self, x: jax.Array):
         logits = self.clf(x)
-        (values, indices) = jax.lax.top_k(logits, self.K)
+        values, indices = jax.lax.top_k(logits, self.K)
         values = nnx.softmax(values, axis=-1)
         y = jax.vmap(self.moe_layer, in_axes=(0, 0), out_axes=0)(
             jnp.broadcast_to(x[None], (self.K, *x.shape)), indices
         )
         return jnp.sum(values[:, None] * y, axis=0)
+
+    def __call__(self, x: jax.Array):
+        if x.ndim > 1:
+            return jax.vmap(self._forward_single)(x)
+        return self._forward_single(x)
 
 
 class GatedMoELayerRagged(nnx.Module):
@@ -155,67 +157,435 @@ class GatedMoELayerNonRagged(GatedMoELayerRagged):
         (values, indices) = jax.lax.top_k(logits, self.K)
         values = nnx.softmax(values, axis=-1)
 
+        y_broad = jnp.broadcast_to(
+            y[:, None, :], (y.shape[0], self.K, self.dmid)
+        )
+
         def forward(y: jax.Array, w: jax.Array):
-            y = jnp.einsum("bi,bij->bj", y, w[indices])
+            y = jnp.einsum("bki,bkij->bkj", y, w[indices])
             y = nnx.leaky_relu(y)
             return y, None
 
         y, _ = jax.lax.scan(
             forward,
-            init=y,
+            init=y_broad,
             xs=self.moe_w.get_value(),
-            nlayers=self.expert_layers,
+            length=self.expert_layers,
         )
 
         return jnp.sum(y * values[..., None], axis=1)
 
 
-if __name__ == "__main__":
+class GatedLowRankMoE(nnx.Module):
+    def __init__(
+        self,
+        din: int,
+        dmid: int,
+        num_experts: int = 8,
+        K: int = 1,
+        rank: int = 32,
+        expert_layers: int = 4,
+        *,
+        rngs: nnx.Rngs,
+        initializer=None,
+    ):
+        initializer = initializer or nnx.initializers.lecun_normal()
+
+        self.din = din
+        self.dmid = dmid
+        self.num_experts = num_experts
+        self.K = K
+        self.rank = rank
+        self.expert_layers = expert_layers
+
+        self.linear_in = nnx.Linear(self.din, self.dmid, rngs=rngs)
+        self.clf = nnx.Linear(self.din, self.num_experts, rngs=rngs)
+
+        self.moe_u = nnx.Param(
+            initializer(
+                rngs(),
+                (self.expert_layers, self.num_experts, self.dmid, self.rank),
+            )
+        )
+        self.moe_v = nnx.Param(
+            initializer(
+                rngs(),
+                (self.expert_layers, self.num_experts, self.rank, self.dmid),
+            )
+        )
+
+    def __call__(self, x: jax.Array):
+        unbatched = x.ndim == 1
+        if unbatched:
+            x = x[None]
+
+        logits = self.clf(x)
+        values, indices = jax.lax.top_k(logits, self.K)
+        values = nnx.softmax(values, axis=-1)
+
+        y = nnx.leaky_relu(self.linear_in(x))
+
+        def forward(y: jax.Array, uv: tuple[jax.Array, jax.Array]):
+            u, v = uv
+            h = nnx.leaky_relu(jnp.einsum("bd,bkdr->bkr", y, u[indices]))
+            dy = jnp.einsum("bkr,bkrd,bk->bd", h, v[indices], values)
+            return y + dy, None
+
+        y, _ = jax.lax.scan(
+            forward,
+            init=y,
+            xs=(self.moe_u.get_value(), self.moe_v.get_value()),
+            length=self.expert_layers,
+        )
+
+        return y[0] if unbatched else y
+
+
+class ExpertChoiceMoE(nnx.Module):
+    def __init__(
+        self,
+        din: int,
+        dmid: int,
+        num_experts: int = 8,
+        K: int = 1,
+        rank: int | None = None,
+        nlayers: int = 2,
+        expert_layers: int = 2,
+        *,
+        rngs: nnx.Rngs,
+        initializer=None,
+    ):
+        initializer = initializer or nnx.initializers.lecun_normal()
+
+        self.din = din
+        self.dmid = dmid
+        self.num_experts = num_experts
+        self.K = K
+        self.rank = rank
+        self.nlayers = nlayers
+        self.expert_layers = expert_layers
+
+        if self.rank is None:
+            self.encoder = MLP(
+                self.din, self.dmid, nlayers=self.nlayers, rngs=rngs
+            )
+            self.clf = nnx.Linear(self.dmid, self.num_experts, rngs=rngs)
+            self.moe_w = nnx.Param(
+                initializer(
+                    rngs(),
+                    (self.expert_layers, self.num_experts, self.dmid, self.dmid),
+                )
+            )
+        else:
+            self.linear_in = nnx.Linear(self.din, self.dmid, rngs=rngs)
+            self.clf = nnx.Linear(self.din, self.num_experts, rngs=rngs)
+            self.moe_u = nnx.Param(
+                initializer(
+                    rngs(),
+                    (self.expert_layers, self.num_experts, self.dmid, self.rank),
+                )
+            )
+            self.moe_v = nnx.Param(
+                initializer(
+                    rngs(),
+                    (self.expert_layers, self.num_experts, self.rank, self.dmid),
+                )
+            )
+
+    def __call__(self, x: jax.Array):
+        unbatched = x.ndim == 1
+        if unbatched:
+            x = x[None]
+
+        batch_size = x.shape[0]
+        c = max(1, (batch_size * self.K) // self.num_experts)
+
+        if self.rank is None:
+            y = self.encoder(x)
+            logits = self.clf(y)
+            scores, token_idx = jax.lax.top_k(logits.T, c)
+            gates = nnx.softmax(scores, axis=-1)
+            y_ec = y[token_idx]
+
+            def forward(y_ec: jax.Array, w: jax.Array):
+                y_ec = nnx.leaky_relu(jnp.einsum("ecd,edh->ech", y_ec, w))
+                return y_ec, None
+
+            y_ec, _ = jax.lax.scan(
+                forward,
+                init=y_ec,
+                xs=self.moe_w.get_value(),
+                length=self.expert_layers,
+            )
+
+            out = jnp.zeros_like(y).at[token_idx].add(y_ec * gates[..., None])
+            return out[0] if unbatched else out
+        else:
+            logits = self.clf(x)
+            scores, token_idx = jax.lax.top_k(logits.T, c)
+            gates = nnx.softmax(scores, axis=-1)
+
+            y = nnx.leaky_relu(self.linear_in(x))
+            y_ec = y[token_idx]
+
+            def forward(y_ec: jax.Array, uv: tuple[jax.Array, jax.Array]):
+                u, v = uv
+                h = nnx.leaky_relu(jnp.einsum("ecd,edr->ecr", y_ec, u))
+                dy_ec = jnp.einsum("ecr,erd->ecd", h * gates[..., None], v)
+                return y_ec + dy_ec, None
+
+            y_ec_out, _ = jax.lax.scan(
+                forward,
+                init=y_ec,
+                xs=(self.moe_u.get_value(), self.moe_v.get_value()),
+                length=self.expert_layers,
+            )
+
+            dy = y_ec_out - y_ec
+            out = y + jnp.zeros_like(y).at[token_idx].add(dy)
+            return out[0] if unbatched else out
+
+
+def count_params(model: nnx.Module) -> int:
+    params = nnx.state(model, nnx.Param)
+    return sum(p.size for p in jax.tree.leaves(params))
+
+
+def build_models(din: int, dmid: int, seed: int):
+    return [
+        (
+            "MLP (L=4)",
+            4,
+            "-",
+            MLP(din, dmid, nlayers=4, rngs=nnx.Rngs(seed)),
+        ),
+        (
+            "MLP (L=8)",
+            8,
+            "-",
+            MLP(din, dmid, nlayers=8, rngs=nnx.Rngs(seed)),
+        ),
+        (
+            "RaggedMoE (E=8, K=1, L=4)",
+            4,
+            8,
+            GatedMoELayerRagged(
+                din,
+                dmid,
+                num_experts=8,
+                K=1,
+                nlayers=2,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "NonRaggedMoE (E=8, K=1, L=4)",
+            4,
+            8,
+            GatedMoELayerNonRagged(
+                din,
+                dmid,
+                num_experts=8,
+                K=1,
+                nlayers=2,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "LowRankMoE (E=8, K=1, r=32, L=4)",
+            4,
+            8,
+            GatedLowRankMoE(
+                din,
+                dmid,
+                num_experts=8,
+                K=1,
+                rank=32,
+                expert_layers=4,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "LowRankMoE (E=8, K=2, r=32, L=4)",
+            4,
+            8,
+            GatedLowRankMoE(
+                din,
+                dmid,
+                num_experts=8,
+                K=2,
+                rank=32,
+                expert_layers=4,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "LowRankMoE (E=16, K=1, r=32, L=4)",
+            4,
+            16,
+            GatedLowRankMoE(
+                din,
+                dmid,
+                num_experts=16,
+                K=1,
+                rank=32,
+                expert_layers=4,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "LowRankMoE (E=16, K=2, r=32, L=4)",
+            4,
+            16,
+            GatedLowRankMoE(
+                din,
+                dmid,
+                num_experts=16,
+                K=2,
+                rank=32,
+                expert_layers=4,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "ExpertChoiceMoE (E=8, K=1, Full, L=4)",
+            4,
+            8,
+            ExpertChoiceMoE(
+                din,
+                dmid,
+                num_experts=8,
+                K=1,
+                rank=None,
+                nlayers=2,
+                expert_layers=2,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "ExpertChoiceMoE (E=8, K=1, r=64, L=4)",
+            4,
+            8,
+            ExpertChoiceMoE(
+                din,
+                dmid,
+                num_experts=8,
+                K=1,
+                rank=64,
+                expert_layers=4,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "ExpertChoiceMoE (E=8, K=2, r=64, L=4)",
+            4,
+            8,
+            ExpertChoiceMoE(
+                din,
+                dmid,
+                num_experts=8,
+                K=2,
+                rank=64,
+                expert_layers=4,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "ExpertChoiceMoE (E=16, K=1, r=64, L=4)",
+            4,
+            16,
+            ExpertChoiceMoE(
+                din,
+                dmid,
+                num_experts=16,
+                K=1,
+                rank=64,
+                expert_layers=4,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+        (
+            "ExpertChoiceMoE (E=16, K=2, r=64, L=4)",
+            4,
+            16,
+            ExpertChoiceMoE(
+                din,
+                dmid,
+                num_experts=16,
+                K=2,
+                rank=64,
+                expert_layers=4,
+                rngs=nnx.Rngs(seed),
+            ),
+        ),
+    ]
+
+
+def benchmark_runtime(f: callable, xs: jax.Array, warmup: int = 8) -> float:
+    for _ in range(warmup):
+        f(xs[-1]).block_until_ready()
+    t = time.monotonic_ns()
+    for idx in range(xs.shape[0]):
+        y: jax.Array = f(xs[idx])
+        y.block_until_ready()
+    return (time.monotonic_ns() - t) / 1e6
+
+
+def main():
     N = 32
     D = 512
-    E = 8
     B = 64
     seed = 42
 
     key = jax.random.key(seed)
-    rngs = nnx.Rngs(key)
-
-    x = jax.random.normal(key, shape=(N,))
-    exp = jnp.array(E // 2, dtype=jnp.int32)
-
-    moe = MoELayer(N, D, E, rngs=rngs)
-    print(moe(x, exp).shape)
-
-    # Check out vmapped operations
-    x = jnp.broadcast_to(jax.random.normal(key, shape=(1, N)), (B, N))
-    exp = jax.random.categorical(key, jnp.ones((E,)), shape=(B,))
-    print(jax.vmap(moe, in_axes=(0, 0), out_axes=0)(x, exp), exp)
-
-    # Check out the Gated Layer
     x = jax.random.normal(key, (B, N))
-    K = E // 2
-    moe_gated = GatedMoETopK(N, D, E, K, rngs=rngs)
-    print(moe_gated(x).shape)
 
-    # Ragged versions
-    moe_gated_ragged = GatedMoELayerRagged(N, D, E, K, rngs=nnx.Rngs(seed))
-    moe_gated_non_ragged = GatedMoELayerRagged(N, D, E, K, rngs=nnx.Rngs(seed))
+    models = build_models(N, D, seed)
 
+    ragged = GatedMoELayerRagged(
+        N,
+        D,
+        num_experts=8,
+        K=1,
+        nlayers=2,
+        expert_layers=2,
+        rngs=nnx.Rngs(seed),
+    )
+    non_ragged = GatedMoELayerNonRagged(
+        N,
+        D,
+        num_experts=8,
+        K=1,
+        nlayers=2,
+        expert_layers=2,
+        rngs=nnx.Rngs(seed),
+    )
     print(
-        moe_gated_ragged(x).shape,
-        moe_gated_non_ragged(x).shape,
-        jnp.isclose(moe_gated_ragged(x), moe_gated_non_ragged(x)).all(),
+        "Verification:",
+        "ragged shape:",
+        ragged(x).shape,
+        "| non-ragged shape:",
+        non_ragged(x).shape,
+        "| match:",
+        bool(jnp.isclose(ragged(x), non_ragged(x), atol=1e-5).all()),
     )
 
-    def runtime(f: callable, repeat: int = 32, warmup: int = 8):
-        for _ in range(warmup):
-            f(x)  # run a few times to compile
-        t = time.monotonic_ns()
-        for _ in range(repeat):
-            y: jax.Array = f(x)
-            y.block_until_ready()
+    repeat = 32
+    xs = jax.random.normal(key, (repeat, B, N))
+    print(
+        f"\n{'Model':<38} | {'Depth':>5} | {'E':>3} | {'Params':>10} | {'Runtime (32 calls, ms)':>22} | {'Per call (ms)':>13}"
+    )
+    print("-" * 105)
+    for name, depth, e_val, model in models:
+        params = count_params(model)
+        total_ms = benchmark_runtime(jax.jit(model), xs)
+        per_call_ms = total_ms / repeat
+        print(
+            f"{name:<38} | {str(depth):>5} | {str(e_val):>3} | {params:>10,d} | {total_ms:>22.2f} | {per_call_ms:>13.3f}"
+        )
 
-        return (time.monotonic_ns() - t) / 1e6
 
-    print(runtime(jax.jit(moe_gated_ragged)))
-    print(runtime(jax.jit(moe_gated_non_ragged)))
+if __name__ == "__main__":
+    main()
